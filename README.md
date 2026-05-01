@@ -6,10 +6,12 @@ A minimal RISC-V emulator written in C that can run Linux.
 
 ## ⚠️ Project Status
 
-> Works on my machine™ (Windows)
+> Works on my machine™ (Windows + Linux/WSL)
 
 * Tested on Windows (PowerShell)
-* Probably doesn't work on Linux/macOS (yet)
+* Tested on Linux (WSL)
+* Likely works on native Linux
+* macOS: untested
 * No guarantees
 * No support
 * No promises
@@ -20,19 +22,52 @@ If it runs on your machine, congratulations.
 
 ## 📦 Requirements
 
-- Windows
-- PowerShell
-- GCC (MinGW or similar) installed and available in PATH
+### Windows
+
+* PowerShell
+* GCC (MinGW or similar) in PATH
+
+### Linux / WSL
+
+* GCC
+* Bash
 
 ---
 
 ## 🚀 How to run
 
-Clone the repository and run:
+### 🪟 Windows (PowerShell)
 
 ```
 .\run.ps1
 ```
+
+---
+
+### 🐧 Linux / WSL
+
+```
+./run.sh
+```
+
+If needed, make it executable first:
+
+```
+chmod +x run.sh
+```
+
+---
+
+### 🔧 Manual build (Linux / WSL)
+
+```
+gcc mini-rv32ima.c -O2 -o mini-rv32ima
+./mini-rv32ima -f Image
+```
+
+---
+
+## 🖥️ What to expect
 
 If everything goes well, you should land in a Linux shell (BusyBox).
 
@@ -54,20 +89,20 @@ root
 
 ## 🔐 Notes
 
-- The system runs entirely inside the emulator
-- There is no real disk, no network, and no access to your host machine
-- You have full root access inside the emulated environment
+* The system runs entirely inside the emulator
+* There is no real disk, no network, and no access to your host machine
+* You have full root access inside the emulated environment
 
 ---
 
 ## ⚠️ Controls / Behavior
 
-- Pressing `Ctrl+C` will exit the emulator immediately  
+* Pressing `Ctrl+C` will exit the emulator immediately
   (it does not send a signal to the emulated Linux system)
 
-- In other words: it kills everything, not just the shell inside Linux
+* In other words: it kills everything, not just the shell inside Linux
 
-- This is a limitation of the current implementation
+* This is a limitation of the current implementation
 
 ---
 
@@ -85,10 +120,10 @@ Just enough to boot a Linux kernel without an MMU.
 
 ## 🎯 Goal
 
-* Make the emulator as simple and readable as possible
-* Remove reliance on obscure or undefined C behavior
+* Keep the emulator simple and readable
+* Avoid obscure or undefined C behavior
 * Make the architecture easy to understand and modify
-* Serve as a base for ports to other languages (e.g. Rust, Python)
+* Serve as a base for ports to other languages (e.g. Rust)
 
 This project aims to turn a minimal emulator into something **didactic, portable, and structurally clean**.
 
@@ -99,7 +134,7 @@ This project aims to turn a minimal emulator into something **didactic, portable
 * Refactored emulator in C
 * Precompiled Linux kernel
 * Minimal root filesystem (Buildroot)
-* One-command runner script
+* One-command runner scripts (`.ps1` and `.sh`)
 
 ---
 
@@ -135,11 +170,6 @@ Expect rough edges.
 
 ---
 
-## 💥 Future work
+## LICENCE
 
-* Rust port
-* Better structure and modularization
-* Platform abstraction (Windows/Linux)
-* Cleaner device model
-
-Or not.
+MIT 

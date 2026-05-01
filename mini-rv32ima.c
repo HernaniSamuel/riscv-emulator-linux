@@ -715,6 +715,37 @@ static int64_t SimpleReadNumberInt( const char * number, int64_t defaultNumber )
 	return (endptr == number) ? defaultNumber : (int64_t)ret;
 }
 
+// Convert a uint32_t from host (little-endian) to big-endian.
+// DTB is a big-endian format regardless of host architecture.
+static inline uint32_t u32_to_be( uint32_t v )
+{
+	return (v >> 24)
+	     | (((v >> 16) & 0xff) <<  8)
+	     | (((v >>  8) & 0xff) << 16)
+	     | ( (v        & 0xff) << 24);
+}
+
+// Patch the memory size field in the embedded default DTB.
+//
+// The default DTB has a sentinel value (0x00c0ff03) at offset 0x13c that
+// marks the "available RAM end" field as unpatched. We overwrite it with
+// the actual usable RAM size (dtb_ptr, big-endian) so the kernel knows
+// how much memory it can use.
+//
+// This only applies to the built-in default DTB. Custom DTBs passed via
+// -b are used as-is and must already have the correct memory size.
+static void patch_dtb_ram_size( uint8_t * ram, uint32_t dtb_ptr )
+{
+	// Offset 0x13c is the memory size cell in the default DTB blob.
+	static const uint32_t DTB_RAM_SIZE_OFFSET   = 0x13c;
+	static const uint32_t DTB_RAM_SIZE_SENTINEL = 0x00c0ff03;
+
+	uint32_t * dtb = (uint32_t *)(ram + dtb_ptr);
+
+	if( dtb[DTB_RAM_SIZE_OFFSET / 4] == DTB_RAM_SIZE_SENTINEL )
+		dtb[DTB_RAM_SIZE_OFFSET / 4] = u32_to_be( dtb_ptr );
+}
+
 //////////////////////////////////////////////////////////////////////////////
 // Emulator load
 //
@@ -790,12 +821,7 @@ static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * 
 			strncpy( (char*)(emu->ram + dtb_ptr + 0xc0), cfg->kernel_cmdline, 54 );
 
 		// Patch default DTB with actual usable RAM size
-		uint32_t * dtb = (uint32_t *)(emu->ram + dtb_ptr);
-		if( dtb[0x13c/4] == 0x00c0ff03 )
-		{
-			uint32_t v = (uint32_t)dtb_ptr;
-			dtb[0x13c/4] = (v>>24) | (((v>>16)&0xff)<<8) | (((v>>8)&0xff)<<16) | ((v&0xff)<<24);
-		}
+		patch_dtb_ram_size( emu->ram, (uint32_t)dtb_ptr );
 	}
 
 	// Initialise CPU

@@ -130,16 +130,121 @@ struct EmulatorState
 // a parameter. Do not use this pointer anywhere else.
 static struct EmulatorState * g_emu = 0;
 
+// Forward declarations needed by the POSIX platform block below.
+// CtrlC references DumpState and ResetKeyboardInput before they are defined.
+static void DumpState( struct EmulatorState * emu );
+static void ResetKeyboardInput();
+
 //////////////////////////////////////////////////////////////////////////////
-// Platform forward declarations
+// Platform: Windows
 //////////////////////////////////////////////////////////////////////////////
 
-static uint64_t GetTimeMicroseconds();
-static void     CaptureKeyboardInput();
-static void     ResetKeyboardInput();
-static void     MiniSleep();
-static int      IsKBHit();
-static int      ReadKBByte();
+#if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
+
+#include <windows.h>
+#include <conio.h>
+
+#define strtoll _strtoi64
+
+static void CaptureKeyboardInput() { system(""); }
+static void ResetKeyboardInput()   {}
+static void MiniSleep()            { Sleep(1); }
+
+static uint64_t GetTimeMicroseconds()
+{
+	static LARGE_INTEGER lpf;
+	LARGE_INTEGER li;
+	if( !lpf.QuadPart ) QueryPerformanceFrequency( &lpf );
+	QueryPerformanceCounter( &li );
+	return ((uint64_t)li.QuadPart * 1000000ULL) / (uint64_t)lpf.QuadPart;
+}
+
+static int IsKBHit() { return _kbhit(); }
+
+static int ReadKBByte()
+{
+	static int is_escape_sequence = 0;
+	if( is_escape_sequence == 1 ) { is_escape_sequence++; return '['; }
+	int r = _getch();
+	if( is_escape_sequence )
+	{
+		is_escape_sequence = 0;
+		switch( r )
+		{
+			case 'H': return 'A'; case 'P': return 'B';
+			case 'K': return 'D'; case 'M': return 'C';
+			case 'G': return 'H'; case 'O': return 'F';
+			default:  return r;
+		}
+	}
+	switch( r )
+	{
+		case 13:  return 10;
+		case 224: is_escape_sequence = 1; return 27;
+		default:  return r;
+	}
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Platform: POSIX
+//////////////////////////////////////////////////////////////////////////////
+
+#else
+
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/time.h>
+
+static void CtrlC( int sig ) { (void)sig; if( g_emu ) DumpState( g_emu ); exit(0); }
+
+static void CaptureKeyboardInput()
+{
+	atexit( ResetKeyboardInput );
+	signal( SIGINT, CtrlC );
+	struct termios term;
+	tcgetattr( 0, &term );
+	term.c_lflag &= ~(ICANON | ECHO);
+	tcsetattr( 0, TCSANOW, &term );
+}
+
+static void ResetKeyboardInput()
+{
+	struct termios term;
+	tcgetattr( 0, &term );
+	term.c_lflag |= ICANON | ECHO;
+	tcsetattr( 0, TCSANOW, &term );
+}
+
+static void MiniSleep() { usleep(500); }
+
+static uint64_t GetTimeMicroseconds()
+{
+	struct timeval tv;
+	gettimeofday( &tv, 0 );
+	return tv.tv_usec + (uint64_t)tv.tv_sec * 1000000ULL;
+}
+
+static int is_eofd = 0;
+
+static int ReadKBByte()
+{
+	if( is_eofd ) return 0xffffffff;
+	char c = 0;
+	return (read( fileno(stdin), &c, 1 ) > 0) ? (int)c : -1;
+}
+
+static int IsKBHit()
+{
+	if( is_eofd ) return -1;
+	int n = 0;
+	ioctl( 0, FIONREAD, &n );
+	if( !n && write( fileno(stdin), 0, 0 ) != 0 ) { is_eofd = 1; return -1; }
+	return !!n;
+}
+
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 // Peripheral I/O
@@ -789,7 +894,7 @@ static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * 
 	fclose( f );
 
 	// Load or embed DTB
-	int dtb_ptr = 0;
+	uint32_t dtb_ptr = 0;
 	if( cfg->dtb_file )
 	{
 		if( strcmp( cfg->dtb_file, "disable" ) != 0 )
@@ -803,7 +908,7 @@ static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * 
 			fseek( f, 0, SEEK_END );
 			long dtblen = ftell( f );
 			fseek( f, 0, SEEK_SET );
-			dtb_ptr = emu->ram_size - dtblen - sizeof( struct MiniRV32IMAState );
+			dtb_ptr = emu->ram_size - (uint32_t)dtblen;
 			if( fread( emu->ram + dtb_ptr, dtblen, 1, f ) != 1 )
 			{
 				fprintf( stderr, "Error: could not load dtb \"%s\"\n", cfg->dtb_file );
@@ -815,10 +920,14 @@ static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * 
 	}
 	else
 	{
-		dtb_ptr = emu->ram_size - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
+		dtb_ptr = emu->ram_size - (uint32_t)sizeof(default64mbdtb);
 		memcpy( emu->ram + dtb_ptr, default64mbdtb, sizeof(default64mbdtb) );
 		if( cfg->kernel_cmdline )
-			strncpy( (char*)(emu->ram + dtb_ptr + 0xc0), cfg->kernel_cmdline, 54 );
+		{
+			// Offset 0xc0 is the chosen/bootargs field in the default DTB blob.
+			static const uint32_t DTB_CMDLINE_OFFSET = 0xc0;
+			strncpy( (char*)(emu->ram + dtb_ptr + DTB_CMDLINE_OFFSET), cfg->kernel_cmdline, 54 );
+		}
 
 		// Patch default DTB with actual usable RAM size
 		patch_dtb_ram_size( emu->ram, (uint32_t)dtb_ptr );
@@ -973,111 +1082,3 @@ int main( int argc, char ** argv )
 	DumpState( &emu );
 	return 0;
 }
-//////////////////////////////////////////////////////////////////////////////
-
-#if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
-
-#include <windows.h>
-#include <conio.h>
-
-#define strtoll _strtoi64
-
-static void CaptureKeyboardInput() { system(""); }
-static void ResetKeyboardInput()   {}
-static void MiniSleep()            { Sleep(1); }
-
-static uint64_t GetTimeMicroseconds()
-{
-	static LARGE_INTEGER lpf;
-	LARGE_INTEGER li;
-	if( !lpf.QuadPart ) QueryPerformanceFrequency( &lpf );
-	QueryPerformanceCounter( &li );
-	return ((uint64_t)li.QuadPart * 1000000ULL) / (uint64_t)lpf.QuadPart;
-}
-
-static int IsKBHit() { return _kbhit(); }
-
-static int ReadKBByte()
-{
-	static int is_escape_sequence = 0;
-	if( is_escape_sequence == 1 ) { is_escape_sequence++; return '['; }
-	int r = _getch();
-	if( is_escape_sequence )
-	{
-		is_escape_sequence = 0;
-		switch( r )
-		{
-			case 'H': return 'A'; case 'P': return 'B';
-			case 'K': return 'D'; case 'M': return 'C';
-			case 'G': return 'H'; case 'O': return 'F';
-			default:  return r;
-		}
-	}
-	switch( r )
-	{
-		case 13:  return 10;
-		case 224: is_escape_sequence = 1; return 27;
-		default:  return r;
-	}
-}
-
-//////////////////////////////////////////////////////////////////////////////
-// Platform: POSIX
-//////////////////////////////////////////////////////////////////////////////
-
-#else
-
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/time.h>
-
-static void CtrlC( int sig ) { (void)sig; if( g_emu ) DumpState( g_emu ); exit(0); }
-
-static void CaptureKeyboardInput()
-{
-	atexit( ResetKeyboardInput );
-	signal( SIGINT, CtrlC );
-	struct termios term;
-	tcgetattr( 0, &term );
-	term.c_lflag &= ~(ICANON | ECHO);
-	tcsetattr( 0, TCSANOW, &term );
-}
-
-static void ResetKeyboardInput()
-{
-	struct termios term;
-	tcgetattr( 0, &term );
-	term.c_lflag |= ICANON | ECHO;
-	tcsetattr( 0, TCSANOW, &term );
-}
-
-static void MiniSleep() { usleep(500); }
-
-static uint64_t GetTimeMicroseconds()
-{
-	struct timeval tv;
-	gettimeofday( &tv, 0 );
-	return tv.tv_usec + (uint64_t)tv.tv_sec * 1000000ULL;
-}
-
-static int is_eofd = 0;
-
-static int ReadKBByte()
-{
-	if( is_eofd ) return 0xffffffff;
-	char c = 0;
-	return (read( fileno(stdin), &c, 1 ) > 0) ? (int)c : -1;
-}
-
-static int IsKBHit()
-{
-	if( is_eofd ) return -1;
-	int n = 0;
-	ioctl( 0, FIONREAD, &n );
-	if( !n && write( fileno(stdin), 0, 0 ) != 0 ) { is_eofd = 1; return -1; }
-	return !!n;
-}
-
-#endif

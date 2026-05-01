@@ -62,15 +62,22 @@ struct MiniRV32IMAState
 };
 
 //////////////////////////////////////////////////////////////////////////////
-// Globals
+// Emulator state
 //////////////////////////////////////////////////////////////////////////////
 
-uint32_t ram_amt             = 64 * 1024 * 1024;
-int      fail_on_all_faults  = 0;
+struct EmulatorState
+{
+	struct MiniRV32IMAState cpu;
+	uint8_t               * ram;
+	uint32_t                ram_size;
+	int                     fail_on_all_faults;
+};
 
-static uint8_t                 * ram_image = 0;
-static struct MiniRV32IMAState * core      = 0;
-static const char              * kernel_command_line = 0;
+// Only used by the POSIX signal handler (CtrlC), which cannot receive
+// a parameter. Do not use this pointer anywhere else.
+static struct EmulatorState * g_emu = 0;
+
+static const char * kernel_command_line = 0;
 
 //////////////////////////////////////////////////////////////////////////////
 // Platform forward declarations
@@ -92,7 +99,7 @@ static int is_mmio( uint32_t addr )
 	return addr >= 0x10000000 && addr < 0x12000000;
 }
 
-static RVStepResult HandleControlStore( uint32_t addy, uint32_t val )
+static RVStepResult HandleControlStore( struct EmulatorState * emu, uint32_t addy, uint32_t val )
 {
 	if( addy == 0x10000000 )       // UART 8250 / 16550 data
 	{
@@ -100,12 +107,12 @@ static RVStepResult HandleControlStore( uint32_t addy, uint32_t val )
 		fflush( stdout );
 	}
 	else if( addy == 0x11004004 )  // CLINT timermatchh
-		core->timermatchh = val;
+		emu->cpu.timermatchh = val;
 	else if( addy == 0x11004000 )  // CLINT timermatchl
-		core->timermatchl = val;
+		emu->cpu.timermatchl = val;
 	else if( addy == 0x11100000 )  // SYSCON (reboot, poweroff, etc.)
 	{
-		core->pc += 4;
+		emu->cpu.pc += 4;
 		if( val == 0x7777 ) return RV_STEP_RESTART;
 		if( val == 0x5555 ) return RV_STEP_POWEROFF;
 		return RV_STEP_FAULT; // unknown syscon value
@@ -113,20 +120,20 @@ static RVStepResult HandleControlStore( uint32_t addy, uint32_t val )
 	return RV_STEP_OK;
 }
 
-static uint32_t HandleControlLoad( uint32_t addy )
+static uint32_t HandleControlLoad( struct EmulatorState * emu, uint32_t addy )
 {
 	if( addy == 0x10000005 )                       // UART line status
 		return 0x60 | IsKBHit();
 	else if( addy == 0x10000000 && IsKBHit() )     // UART RX
 		return ReadKBByte();
 	else if( addy == 0x1100bffc )                  // CLINT timerh
-		return core->timerh;
+		return emu->cpu.timerh;
 	else if( addy == 0x1100bff8 )                  // CLINT timerl
-		return core->timerl;
+		return emu->cpu.timerl;
 	return 0;
 }
 
-static void HandleOtherCSRWrite( uint8_t * image, uint16_t csrno, uint32_t value )
+static void HandleOtherCSRWrite( struct EmulatorState * emu, uint16_t csrno, uint32_t value )
 {
 	if( csrno == 0x136 )
 	{
@@ -140,15 +147,15 @@ static void HandleOtherCSRWrite( uint8_t * image, uint16_t csrno, uint32_t value
 	{
 		uint32_t ptrstart = value - RAM_IMAGE_OFFSET;
 		uint32_t ptrend   = ptrstart;
-		if( ptrstart >= ram_amt )
+		if( ptrstart >= emu->ram_size )
 		{
 			printf( "DEBUG PASSED INVALID PTR (%08x)\n", value );
 			return;
 		}
-		while( ptrend < ram_amt && image[ptrend] != 0 )
+		while( ptrend < emu->ram_size && emu->ram[ptrend] != 0 )
 			ptrend++;
 		if( ptrend != ptrstart )
-			fwrite( image + ptrstart, ptrend - ptrstart, 1, stdout );
+			fwrite( emu->ram + ptrstart, ptrend - ptrstart, 1, stdout );
 	}
 	else if( csrno == 0x139 )
 	{
@@ -156,8 +163,9 @@ static void HandleOtherCSRWrite( uint8_t * image, uint16_t csrno, uint32_t value
 	}
 }
 
-static int32_t HandleOtherCSRRead( uint8_t * image, uint16_t csrno )
+static int32_t HandleOtherCSRRead( struct EmulatorState * emu, uint16_t csrno )
 {
+	(void)emu;
 	if( csrno == 0x140 )
 	{
 		if( !IsKBHit() ) return -1;
@@ -183,8 +191,12 @@ static inline void mem_store4( uint8_t * image, uint32_t ofs, uint32_t val ) { *
 // CPU step
 //////////////////////////////////////////////////////////////////////////////
 
-static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image, uint32_t elapsedUs, int count )
+static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapsedUs, int count )
 {
+	struct MiniRV32IMAState * state = &emu->cpu;
+	uint8_t  * image    = emu->ram;
+	uint32_t   ram_size = emu->ram_size;
+
 	// Advance timer
 	uint32_t new_timer = state->timerl + elapsedUs;
 	if( new_timer < state->timerl ) state->timerh++;
@@ -224,7 +236,7 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 		cycle++;
 		uint32_t ofs_pc = pc - RAM_IMAGE_OFFSET;
 
-		if( ofs_pc >= ram_amt )
+		if( ofs_pc >= ram_size )
 		{
 			trap = 2; // instruction access fault
 			break;
@@ -300,10 +312,10 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 				uint32_t addr   = state->regs[(ir >> 15) & 0x1f] + imm_se;
 				uint32_t ofs    = addr - RAM_IMAGE_OFFSET;
 
-				if( ofs >= ram_amt - 3 )
+				if( ofs >= ram_size - 3 )
 				{
 					if( is_mmio(addr) )
-						rval = HandleControlLoad( addr );
+						rval = HandleControlLoad( emu, addr );
 					else { trap = 5; rval = addr; } // load access fault
 				}
 				else
@@ -331,11 +343,11 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 				uint32_t ofs  = addr - RAM_IMAGE_OFFSET;
 				rdid = 0;
 
-				if( ofs >= ram_amt - 3 )
+				if( ofs >= ram_size - 3 )
 				{
 					if( is_mmio(addr) )
 					{
-						RVStepResult sr = HandleControlStore( addr, rs2 );
+						RVStepResult sr = HandleControlStore( emu, addr, rs2 );
 						if( sr != RV_STEP_OK ) return sr;
 					}
 					else { trap = 7; rval = addr; } // store access fault
@@ -421,7 +433,7 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 						case 0x343: rval = state->mtval;    break;
 						case 0xf11: rval = 0xff0ff0ff;      break; // mvendorid
 						case 0x301: rval = 0x40401101;      break; // misa: RV32IMA
-						default:    rval = HandleOtherCSRRead( image, csrno ); break;
+						default:    rval = HandleOtherCSRRead( emu, csrno ); break;
 					}
 
 					switch( microop )
@@ -444,7 +456,7 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 						case 0x300: state->mstatus  = writeval; break;
 						case 0x342: state->mcause   = writeval; break;
 						case 0x343: state->mtval    = writeval; break;
-						default:    HandleOtherCSRWrite( image, csrno, writeval ); break;
+						default:    HandleOtherCSRWrite( emu, csrno, writeval ); break;
 					}
 				}
 				else if( microop == 0 ) // SYSTEM
@@ -487,7 +499,7 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 				uint32_t irmid = (ir >> 27) & 0x1f;
 				uint32_t ofs   = rs1 - RAM_IMAGE_OFFSET;
 
-				if( ofs >= ram_amt - 3 )
+				if( ofs >= ram_size - 3 )
 				{
 					trap = 7; // store/AMO access fault
 					rval = rs1;
@@ -523,7 +535,7 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 		if( trap )
 		{
 			state->pc = pc;
-			if( fail_on_all_faults ) { printf( "FAULT\n" ); return RV_STEP_FAULT; }
+			if( emu->fail_on_all_faults ) { printf( "FAULT\n" ); return RV_STEP_FAULT; }
 			break;
 		}
 
@@ -564,16 +576,17 @@ static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * 
 // Debug
 //////////////////////////////////////////////////////////////////////////////
 
-static void DumpState( struct MiniRV32IMAState * core, uint8_t * ram_image )
+static void DumpState( struct EmulatorState * emu )
 {
+	struct MiniRV32IMAState * core = &emu->cpu;
 	uint32_t pc        = core->pc;
 	uint32_t pc_offset = pc - RAM_IMAGE_OFFSET;
 	uint32_t ir        = 0;
 
 	printf( "PC: %08x ", pc );
-	if( pc_offset < ram_amt - 3 )
+	if( pc_offset < emu->ram_size - 3 )
 	{
-		ir = mem_load4( ram_image, pc_offset );
+		ir = mem_load4( emu->ram, pc_offset );
 		printf( "[0x%08x] ", ir );
 	}
 	else
@@ -624,8 +637,13 @@ int main( int argc, char ** argv )
 	int          do_sleep         = 1;
 	int          single_step      = 0;
 	int          dtb_ptr          = 0;
+	uint32_t     ram_size         = 64 * 1024 * 1024;
 	const char * image_file_name  = 0;
 	const char * dtb_file_name    = 0;
+
+	struct EmulatorState emu;
+	memset( &emu, 0, sizeof(emu) );
+	emu.fail_on_all_faults = 0;
 
 	for( i = 1; i < argc; i++ )
 	{
@@ -637,15 +655,15 @@ int main( int argc, char ** argv )
 			{
 				switch( param[1] )
 				{
-					case 'm': if( ++i < argc ) ram_amt            = SimpleReadNumberInt( argv[i], ram_amt ); break;
-					case 'c': if( ++i < argc ) instct             = SimpleReadNumberInt( argv[i], -1 );      break;
-					case 'k': if( ++i < argc ) kernel_command_line = argv[i];                                break;
-					case 'f': image_file_name  = (++i < argc) ? argv[i] : 0;                                break;
-					case 'b': dtb_file_name    = (++i < argc) ? argv[i] : 0;                                break;
-					case 'l': param_continue = 1; fixed_update       = 1; break;
-					case 'p': param_continue = 1; do_sleep            = 0; break;
-					case 's': param_continue = 1; single_step         = 1; break;
-					case 'd': param_continue = 1; fail_on_all_faults  = 1; break;
+					case 'm': if( ++i < argc ) ram_size           = SimpleReadNumberInt( argv[i], ram_size ); break;
+					case 'c': if( ++i < argc ) instct             = SimpleReadNumberInt( argv[i], -1 );       break;
+					case 'k': if( ++i < argc ) kernel_command_line = argv[i];                                 break;
+					case 'f': image_file_name  = (++i < argc) ? argv[i] : 0;                                 break;
+					case 'b': dtb_file_name    = (++i < argc) ? argv[i] : 0;                                 break;
+					case 'l': param_continue = 1; fixed_update           = 1; break;
+					case 'p': param_continue = 1; do_sleep                = 0; break;
+					case 's': param_continue = 1; single_step             = 1; break;
+					case 'd': param_continue = 1; emu.fail_on_all_faults  = 1; break;
 					case 't': if( ++i < argc ) time_divisor = SimpleReadNumberInt( argv[i], 1 ); break;
 					default:
 						if( param_continue ) param_continue = 0;
@@ -675,12 +693,15 @@ int main( int argc, char ** argv )
 		return 1;
 	}
 
-	ram_image = malloc( ram_amt );
-	if( !ram_image )
+	emu.ram_size = ram_size;
+	emu.ram      = malloc( ram_size );
+	if( !emu.ram )
 	{
 		fprintf( stderr, "Error: could not allocate system image.\n" );
 		return -4;
 	}
+
+	g_emu = &emu;
 
 restart:
 	{
@@ -693,13 +714,13 @@ restart:
 		fseek( f, 0, SEEK_END );
 		long flen = ftell( f );
 		fseek( f, 0, SEEK_SET );
-		if( flen > ram_amt )
+		if( (uint32_t)flen > ram_size )
 		{
-			fprintf( stderr, "Error: image (%ld bytes) does not fit in %d bytes of RAM\n", flen, ram_amt );
+			fprintf( stderr, "Error: image (%ld bytes) does not fit in %u bytes of RAM\n", flen, ram_size );
 			return -6;
 		}
-		memset( ram_image, 0, ram_amt );
-		if( fread( ram_image, flen, 1, f ) != 1 )
+		memset( emu.ram, 0, ram_size );
+		if( fread( emu.ram, flen, 1, f ) != 1 )
 		{
 			fprintf( stderr, "Error: could not load image.\n" );
 			return -7;
@@ -719,8 +740,8 @@ restart:
 				fseek( f, 0, SEEK_END );
 				long dtblen = ftell( f );
 				fseek( f, 0, SEEK_SET );
-				dtb_ptr = ram_amt - dtblen - sizeof( struct MiniRV32IMAState );
-				if( fread( ram_image + dtb_ptr, dtblen, 1, f ) != 1 )
+				dtb_ptr = ram_size - dtblen - sizeof( struct MiniRV32IMAState );
+				if( fread( emu.ram + dtb_ptr, dtblen, 1, f ) != 1 )
 				{
 					fprintf( stderr, "Error: could not load dtb \"%s\"\n", dtb_file_name );
 					return -9;
@@ -730,25 +751,26 @@ restart:
 		}
 		else
 		{
-			dtb_ptr = ram_amt - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
-			memcpy( ram_image + dtb_ptr, default64mbdtb, sizeof(default64mbdtb) );
+			dtb_ptr = ram_size - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
+			memcpy( emu.ram + dtb_ptr, default64mbdtb, sizeof(default64mbdtb) );
 			if( kernel_command_line )
-				strncpy( (char*)(ram_image + dtb_ptr + 0xc0), kernel_command_line, 54 );
+				strncpy( (char*)(emu.ram + dtb_ptr + 0xc0), kernel_command_line, 54 );
 		}
 	}
 
 	CaptureKeyboardInput();
 
-	core = (struct MiniRV32IMAState *)(ram_image + ram_amt - sizeof( struct MiniRV32IMAState ));
-	core->pc          = RAM_IMAGE_OFFSET;
-	core->regs[10]    = 0x00;                                         // hart ID
-	core->regs[11]    = dtb_ptr ? (dtb_ptr + RAM_IMAGE_OFFSET) : 0;  // dtb pointer
-	core->extraflags |= 3;                                            // machine mode
+	// CPU lives at the very end of RAM
+	memset( &emu.cpu, 0, sizeof(emu.cpu) );
+	emu.cpu.pc          = RAM_IMAGE_OFFSET;
+	emu.cpu.regs[10]    = 0x00;                                          // hart ID
+	emu.cpu.regs[11]    = dtb_ptr ? (dtb_ptr + RAM_IMAGE_OFFSET) : 0;   // dtb pointer
+	emu.cpu.extraflags |= 3;                                             // machine mode
 
 	if( dtb_file_name == 0 )
 	{
 		// Patch default DTB with actual usable RAM size
-		uint32_t * dtb = (uint32_t *)(ram_image + dtb_ptr);
+		uint32_t * dtb = (uint32_t *)(emu.ram + dtb_ptr);
 		if( dtb[0x13c/4] == 0x00c0ff03 )
 		{
 			uint32_t v = dtb_ptr;
@@ -756,32 +778,32 @@ restart:
 		}
 	}
 
-	uint64_t lastTime       = fixed_update ? 0 : (GetTimeMicroseconds() / time_divisor);
+	uint64_t lastTime        = fixed_update ? 0 : (GetTimeMicroseconds() / time_divisor);
 	int      instrs_per_flip = single_step ? 1 : 1024;
 
 	for( uint64_t rt = 0; rt < (uint64_t)(instct + 1) || instct < 0; rt += instrs_per_flip )
 	{
-		uint64_t * this_ccount = (uint64_t *)&core->cyclel;
+		uint64_t * this_ccount = (uint64_t *)&emu.cpu.cyclel;
 		uint32_t   elapsedUs   = fixed_update
 		                       ? (uint32_t)(*this_ccount / time_divisor - lastTime)
 		                       : (uint32_t)(GetTimeMicroseconds() / time_divisor - lastTime);
 		lastTime += elapsedUs;
 
-		if( single_step ) DumpState( core, ram_image );
+		if( single_step ) DumpState( &emu );
 
-		RVStepResult ret = MiniRV32IMAStep( core, ram_image, elapsedUs, instrs_per_flip );
+		RVStepResult ret = MiniRV32IMAStep( &emu, elapsedUs, instrs_per_flip );
 		switch( ret )
 		{
 			case RV_STEP_OK:       break;
 			case RV_STEP_WFI:      if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
 			case RV_STEP_FAULT:    instct = 0; break;
 			case RV_STEP_RESTART:  goto restart;
-			case RV_STEP_POWEROFF: printf( "POWEROFF@0x%08x%08x\n", core->cycleh, core->cyclel ); return 0;
+			case RV_STEP_POWEROFF: printf( "POWEROFF@0x%08x%08x\n", emu.cpu.cycleh, emu.cpu.cyclel ); return 0;
 			default:               printf( "Unknown failure\n" ); break;
 		}
 	}
 
-	DumpState( core, ram_image );
+	DumpState( &emu );
 	return 0;
 }
 
@@ -847,7 +869,7 @@ static int ReadKBByte()
 #include <signal.h>
 #include <sys/time.h>
 
-static void CtrlC( int sig ) { DumpState( core, ram_image ); exit(0); }
+static void CtrlC( int sig ) { (void)sig; if( g_emu ) DumpState( g_emu ); exit(0); }
 
 static void CaptureKeyboardInput()
 {

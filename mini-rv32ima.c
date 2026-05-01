@@ -16,6 +16,19 @@
 static const uint32_t RAM_IMAGE_OFFSET = 0x80000000;
 
 //////////////////////////////////////////////////////////////////////////////
+// Step result codes
+//////////////////////////////////////////////////////////////////////////////
+
+typedef enum
+{
+	RV_STEP_OK       = 0,     // normal execution
+	RV_STEP_WFI      = 1,     // processor halted waiting for interrupt
+	RV_STEP_FAULT    = 3,     // hard fault, abort requested
+	RV_STEP_RESTART  = 0x7777, // guest wrote syscon restart code
+	RV_STEP_POWEROFF = 0x5555, // guest wrote syscon poweroff code
+} RVStepResult;
+
+//////////////////////////////////////////////////////////////////////////////
 // CPU state
 //////////////////////////////////////////////////////////////////////////////
 
@@ -79,7 +92,7 @@ static int is_mmio( uint32_t addr )
 	return addr >= 0x10000000 && addr < 0x12000000;
 }
 
-static uint32_t HandleControlStore( uint32_t addy, uint32_t val )
+static RVStepResult HandleControlStore( uint32_t addy, uint32_t val )
 {
 	if( addy == 0x10000000 )       // UART 8250 / 16550 data
 	{
@@ -93,9 +106,11 @@ static uint32_t HandleControlStore( uint32_t addy, uint32_t val )
 	else if( addy == 0x11100000 )  // SYSCON (reboot, poweroff, etc.)
 	{
 		core->pc += 4;
-		return val;
+		if( val == 0x7777 ) return RV_STEP_RESTART;
+		if( val == 0x5555 ) return RV_STEP_POWEROFF;
+		return RV_STEP_FAULT; // unknown syscon value
 	}
-	return 0;
+	return RV_STEP_OK;
 }
 
 static uint32_t HandleControlLoad( uint32_t addy )
@@ -168,7 +183,7 @@ static inline void mem_store4( uint8_t * image, uint32_t ofs, uint32_t val ) { *
 // CPU step
 //////////////////////////////////////////////////////////////////////////////
 
-static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image, uint32_t elapsedUs, int count )
+static RVStepResult MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image, uint32_t elapsedUs, int count )
 {
 	// Advance timer
 	uint32_t new_timer = state->timerl + elapsedUs;
@@ -188,7 +203,7 @@ static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image
 
 	// WFI: processor sleeping
 	if( state->extraflags & 4 )
-		return 1;
+		return RV_STEP_WFI;
 
 	uint32_t trap  = 0;
 	uint32_t rval  = 0;
@@ -320,7 +335,8 @@ static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image
 				{
 					if( is_mmio(addr) )
 					{
-						if( HandleControlStore( addr, rs2 ) ) return rs2;
+						RVStepResult sr = HandleControlStore( addr, rs2 );
+						if( sr != RV_STEP_OK ) return sr;
 					}
 					else { trap = 7; rval = addr; } // store access fault
 				}
@@ -454,7 +470,7 @@ static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image
 								if( state->cyclel > cycle ) state->cycleh++;
 								state->cyclel = cycle;
 								state->pc     = pc + 4;
-								return 1;
+								return RV_STEP_WFI;
 							default: trap = 2; // illegal
 						}
 					}
@@ -507,7 +523,7 @@ static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image
 		if( trap )
 		{
 			state->pc = pc;
-			if( fail_on_all_faults ) { printf( "FAULT\n" ); return 3; }
+			if( fail_on_all_faults ) { printf( "FAULT\n" ); return RV_STEP_FAULT; }
 			break;
 		}
 
@@ -541,7 +557,7 @@ static int32_t MiniRV32IMAStep( struct MiniRV32IMAState * state, uint8_t * image
 	if( state->cyclel > cycle ) state->cycleh++;
 	state->cyclel = cycle;
 	state->pc     = pc;
-	return 0;
+	return RV_STEP_OK;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -753,15 +769,15 @@ restart:
 
 		if( single_step ) DumpState( core, ram_image );
 
-		int ret = MiniRV32IMAStep( core, ram_image, elapsedUs, instrs_per_flip );
+		RVStepResult ret = MiniRV32IMAStep( core, ram_image, elapsedUs, instrs_per_flip );
 		switch( ret )
 		{
-			case 0: break;
-			case 1: if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
-			case 3: instct = 0; break;
-			case 0x7777: goto restart;
-			case 0x5555: printf( "POWEROFF@0x%08x%08x\n", core->cycleh, core->cyclel ); return 0;
-			default: printf( "Unknown failure\n" ); break;
+			case RV_STEP_OK:       break;
+			case RV_STEP_WFI:      if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
+			case RV_STEP_FAULT:    instct = 0; break;
+			case RV_STEP_RESTART:  goto restart;
+			case RV_STEP_POWEROFF: printf( "POWEROFF@0x%08x%08x\n", core->cycleh, core->cyclel ); return 0;
+			default:               printf( "Unknown failure\n" ); break;
 		}
 	}
 

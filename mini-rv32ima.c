@@ -188,6 +188,58 @@ static inline void mem_store2( uint8_t * image, uint32_t ofs, uint32_t val ) { *
 static inline void mem_store4( uint8_t * image, uint32_t ofs, uint32_t val ) { *(uint32_t *)(image + ofs) = val; }
 
 //////////////////////////////////////////////////////////////////////////////
+// Immediate decode — one function per RISC-V instruction format
+//
+// Every RV32I instruction encodes its immediate in one of these five layouts.
+// Centralizing the bit manipulation here means:
+//   - execute logic reads as intent, not as bit twiddling
+//   - adding new instructions only requires picking the right format
+//   - porting to another language means translating 5 functions, not N cases
+//
+// All functions return a sign-extended int32_t matching the spec.
+//////////////////////////////////////////////////////////////////////////////
+
+// Format I: loads, JALR, OP-IMM   [31:20]
+static inline int32_t decode_imm_I( uint32_t ir )
+{
+	uint32_t imm = ir >> 20;
+	return (int32_t)(imm | ((imm & 0x800) ? 0xfffff000 : 0));
+}
+
+// Format S: stores   [31:25|11:7]
+static inline int32_t decode_imm_S( uint32_t ir )
+{
+	uint32_t imm = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
+	return (int32_t)(imm | ((imm & 0x800) ? 0xfffff000 : 0));
+}
+
+// Format B: branches   [31|7|30:25|11:8] (multiples of 2, bit 0 always 0)
+static inline int32_t decode_imm_B( uint32_t ir )
+{
+	uint32_t imm = ((ir & 0xf00)      >>  7)
+	             | ((ir & 0x7e000000)  >> 20)
+	             | ((ir & 0x80)        <<  4)
+	             | ((ir >> 31)         << 12);
+	return (int32_t)(imm | ((imm & 0x1000) ? 0xffffe000 : 0));
+}
+
+// Format J: JAL   [31|19:12|20|30:21] (multiples of 2, bit 0 always 0)
+static inline int32_t decode_imm_J( uint32_t ir )
+{
+	uint32_t imm = ((ir & 0x80000000) >> 11)
+	             | ((ir & 0x7fe00000) >> 20)
+	             | ((ir & 0x00100000) >>  9)
+	             |  (ir & 0x000ff000);
+	return (int32_t)(imm | ((imm & 0x00100000) ? 0xffe00000 : 0));
+}
+
+// Format U: LUI, AUIPC   [31:12] (lower 12 bits always zero)
+static inline int32_t decode_imm_U( uint32_t ir )
+{
+	return (int32_t)(ir & 0xfffff000);
+}
+
+//////////////////////////////////////////////////////////////////////////////
 // CPU step
 //////////////////////////////////////////////////////////////////////////////
 
@@ -253,20 +305,16 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 		switch( ir & 0x7f )
 		{
 			case 0x37: // LUI
-				rval = ir & 0xfffff000;
+				rval = decode_imm_U( ir );
 				break;
 
 			case 0x17: // AUIPC
-				rval = pc + (ir & 0xfffff000);
+				rval = pc + decode_imm_U( ir );
 				break;
 
 			case 0x6f: // JAL
 			{
-				int32_t offset = ((ir & 0x80000000) >> 11)
-				               | ((ir & 0x7fe00000) >> 20)
-				               | ((ir & 0x00100000) >>  9)
-				               |  (ir & 0x000ff000);
-				if( offset & 0x00100000 ) offset |= 0xffe00000; // sign extend
+				int32_t offset = decode_imm_J( ir );
 				rval = pc + 4;
 				pc   = pc + offset - 4;
 				break;
@@ -274,8 +322,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 			case 0x67: // JALR
 			{
-				uint32_t imm    = ir >> 20;
-				int32_t  imm_se = imm | ((imm & 0x800) ? 0xfffff000 : 0);
+				int32_t imm_se = decode_imm_I( ir );
 				rval = pc + 4;
 				pc   = ((state->regs[(ir >> 15) & 0x1f] + imm_se) & ~1) - 4;
 				break;
@@ -283,11 +330,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 			case 0x63: // Branch
 			{
-				uint32_t offset = ((ir & 0xf00)     >>  7)
-				                | ((ir & 0x7e000000) >> 20)
-				                | ((ir & 0x80)       <<  4)
-				                | ((ir >> 31)        << 12);
-				if( offset & 0x1000 ) offset |= 0xffffe000; // sign extend
+				int32_t  offset = decode_imm_B( ir );
 				int32_t  rs1    = state->regs[(ir >> 15) & 0x1f];
 				int32_t  rs2    = state->regs[(ir >> 20) & 0x1f];
 				uint32_t target = pc + offset - 4;
@@ -307,8 +350,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 			case 0x03: // Load
 			{
-				uint32_t imm    = ir >> 20;
-				int32_t  imm_se = imm | ((imm & 0x800) ? 0xfffff000 : 0);
+				int32_t  imm_se = decode_imm_I( ir );
 				uint32_t addr   = state->regs[(ir >> 15) & 0x1f] + imm_se;
 				uint32_t ofs    = addr - RAM_IMAGE_OFFSET;
 
@@ -335,8 +377,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 			case 0x23: // Store
 			{
-				uint32_t imm  = ((ir >> 7) & 0x1f) | ((ir & 0xfe000000) >> 20);
-				if( imm & 0x800 ) imm |= 0xfffff000; // sign extend
+				int32_t  imm  = decode_imm_S( ir );
 				uint32_t rs1  = state->regs[(ir >> 15) & 0x1f];
 				uint32_t rs2  = state->regs[(ir >> 20) & 0x1f];
 				uint32_t addr = rs1 + imm;
@@ -368,11 +409,10 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 			case 0x13: // OP-IMM
 			case 0x33: // OP
 			{
-				uint32_t imm    = ir >> 20;
-				imm = imm | ((imm & 0x800) ? 0xfffff000 : 0); // sign extend
+				int32_t  imm    = decode_imm_I( ir );
 				uint32_t rs1    = state->regs[(ir >> 15) & 0x1f];
 				int      is_reg = !!(ir & 0x20);
-				uint32_t rs2    = is_reg ? state->regs[imm & 0x1f] : imm;
+				uint32_t rs2    = is_reg ? state->regs[imm & 0x1f] : (uint32_t)imm;
 
 				if( is_reg && (ir & 0x02000000) ) // RV32M
 				{

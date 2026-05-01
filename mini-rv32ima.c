@@ -115,8 +115,48 @@ static inline uint64_t cpu_get_cycle64( const struct MiniRV32IMAState * s ) { re
 static inline void     cpu_set_cycle64( struct MiniRV32IMAState * s, uint64_t v ) { s->cyclel = (uint32_t)v; s->cycleh = (uint32_t)(v >> 32); }
 
 //////////////////////////////////////////////////////////////////////////////
-// Emulator state
+// CSR addresses
+//
+// Values are the 12-bit CSR addresses from the RISC-V privileged spec
+// (volume II). Only the CSRs implemented in this emulator are listed.
+// Add new entries here as more CSRs are implemented.
+//
+// 0x000-0x0ff  unprivileged / user-mode
+// 0x100-0x1ff  supervisor-mode
+// 0x300-0x3ff  machine-mode read/write
+// 0xc00-0xcff  unprivileged counters (read-only)
+// 0xf00-0xfff  machine-mode read-only info
+//
+// 0x130-0x13f  non-standard debug/print CSRs (emulator extension)
+// 0x140        non-standard keyboard input CSR (emulator extension)
 //////////////////////////////////////////////////////////////////////////////
+
+typedef enum
+{
+	// Machine-mode read/write
+	CSR_MSTATUS   = 0x300,  // machine status
+	CSR_MISA      = 0x301,  // ISA and extensions (read-only in this impl)
+	CSR_MIE       = 0x304,  // machine interrupt enable
+	CSR_MTVEC     = 0x305,  // machine trap-handler base address
+	CSR_MSCRATCH  = 0x340,  // scratch register for machine trap handlers
+	CSR_MEPC      = 0x341,  // machine exception program counter
+	CSR_MCAUSE    = 0x342,  // machine trap cause
+	CSR_MTVAL     = 0x343,  // machine bad address or instruction
+	CSR_MIP       = 0x344,  // machine interrupt pending
+
+	// Unprivileged counters (read-only)
+	CSR_CYCLE     = 0xc00,  // cycle counter for RDCYCLE
+
+	// Machine-mode read-only info
+	CSR_MVENDORID = 0xf11,  // vendor ID
+
+	// Non-standard emulator debug/print extension
+	CSR_PRINT_INT  = 0x136, // print value as decimal integer to stdout
+	CSR_PRINT_HEX  = 0x137, // print value as hex to stdout
+	CSR_PRINT_STR  = 0x138, // print null-terminated string at guest address
+	CSR_PRINT_CHAR = 0x139, // print single character to stdout
+	CSR_READ_KBD   = 0x140, // read one byte from keyboard (-1 if none)
+} RVCsr;
 
 struct EmulatorState
 {
@@ -291,15 +331,15 @@ static uint32_t HandleControlLoad( struct EmulatorState * emu, uint32_t addy )
 
 static void HandleOtherCSRWrite( struct EmulatorState * emu, uint16_t csrno, uint32_t value )
 {
-	if( csrno == 0x136 )
+	if( csrno == CSR_PRINT_INT )
 	{
 		printf( "%d", value ); fflush( stdout );
 	}
-	else if( csrno == 0x137 )
+	else if( csrno == CSR_PRINT_HEX )
 	{
 		printf( "%08x", value ); fflush( stdout );
 	}
-	else if( csrno == 0x138 )
+	else if( csrno == CSR_PRINT_STR )
 	{
 		uint32_t ptrstart = value - RAM_IMAGE_OFFSET;
 		uint32_t ptrend   = ptrstart;
@@ -313,7 +353,7 @@ static void HandleOtherCSRWrite( struct EmulatorState * emu, uint16_t csrno, uin
 		if( ptrend != ptrstart )
 			fwrite( emu->ram + ptrstart, ptrend - ptrstart, 1, stdout );
 	}
-	else if( csrno == 0x139 )
+	else if( csrno == CSR_PRINT_CHAR )
 	{
 		putchar( value ); fflush( stdout );
 	}
@@ -322,7 +362,7 @@ static void HandleOtherCSRWrite( struct EmulatorState * emu, uint16_t csrno, uin
 static int32_t HandleOtherCSRRead( struct EmulatorState * emu, uint16_t csrno )
 {
 	(void)emu;
-	if( csrno == 0x140 )
+	if( csrno == CSR_READ_KBD )
 	{
 		if( !IsKBHit() ) return -1;
 		return ReadKBByte();
@@ -618,18 +658,18 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 					switch( csrno )
 					{
-						case 0x340: rval = state->mscratch; break;
-						case 0x305: rval = state->mtvec;    break;
-						case 0x304: rval = state->mie;      break;
-						case 0xc00: rval = cycle;           break;
-						case 0x344: rval = state->mip;      break;
-						case 0x341: rval = state->mepc;     break;
-						case 0x300: rval = state->mstatus;  break;
-						case 0x342: rval = state->mcause;   break;
-						case 0x343: rval = state->mtval;    break;
-						case 0xf11: rval = 0xff0ff0ff;      break; // mvendorid
-						case 0x301: rval = 0x40401101;      break; // misa: RV32IMA
-						default:    rval = HandleOtherCSRRead( emu, csrno ); break;
+						case CSR_MSCRATCH:  rval = state->mscratch; break;
+						case CSR_MTVEC:     rval = state->mtvec;    break;
+						case CSR_MIE:       rval = state->mie;      break;
+						case CSR_CYCLE:     rval = cycle;           break;
+						case CSR_MIP:       rval = state->mip;      break;
+						case CSR_MEPC:      rval = state->mepc;     break;
+						case CSR_MSTATUS:   rval = state->mstatus;  break;
+						case CSR_MCAUSE:    rval = state->mcause;   break;
+						case CSR_MTVAL:     rval = state->mtval;    break;
+						case CSR_MVENDORID: rval = 0xff0ff0ff;      break;
+						case CSR_MISA:      rval = 0x40401101;      break; // RV32IMA
+						default:            rval = HandleOtherCSRRead( emu, csrno ); break;
 					}
 
 					switch( microop )
@@ -644,15 +684,15 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 					switch( csrno )
 					{
-						case 0x340: state->mscratch = writeval; break;
-						case 0x305: state->mtvec    = writeval; break;
-						case 0x304: state->mie      = writeval; break;
-						case 0x344: state->mip      = writeval; break;
-						case 0x341: state->mepc     = writeval; break;
-						case 0x300: state->mstatus  = writeval; break;
-						case 0x342: state->mcause   = writeval; break;
-						case 0x343: state->mtval    = writeval; break;
-						default:    HandleOtherCSRWrite( emu, csrno, writeval ); break;
+						case CSR_MSCRATCH: state->mscratch = writeval; break;
+						case CSR_MTVEC:    state->mtvec    = writeval; break;
+						case CSR_MIE:      state->mie      = writeval; break;
+						case CSR_MIP:      state->mip      = writeval; break;
+						case CSR_MEPC:     state->mepc     = writeval; break;
+						case CSR_MSTATUS:  state->mstatus  = writeval; break;
+						case CSR_MCAUSE:   state->mcause   = writeval; break;
+						case CSR_MTVAL:    state->mtval    = writeval; break;
+						default:           HandleOtherCSRWrite( emu, csrno, writeval ); break;
 					}
 				}
 				else if( microop == 0 ) // SYSTEM
@@ -925,8 +965,10 @@ static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * 
 		if( cfg->kernel_cmdline )
 		{
 			// Offset 0xc0 is the chosen/bootargs field in the default DTB blob.
-			static const uint32_t DTB_CMDLINE_OFFSET = 0xc0;
-			strncpy( (char*)(emu->ram + dtb_ptr + DTB_CMDLINE_OFFSET), cfg->kernel_cmdline, 54 );
+			// Max length 54 is the size of that field in the default DTB blob.
+			static const uint32_t DTB_CMDLINE_OFFSET  = 0xc0;
+			static const uint32_t DTB_CMDLINE_MAX_LEN = 54;
+			strncpy( (char*)(emu->ram + dtb_ptr + DTB_CMDLINE_OFFSET), cfg->kernel_cmdline, DTB_CMDLINE_MAX_LEN );
 		}
 
 		// Patch default DTB with actual usable RAM size

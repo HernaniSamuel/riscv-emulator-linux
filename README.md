@@ -1,4 +1,4 @@
-# riscv-c
+# riscv-emulator-linux
 
 A minimal RISC-V emulator written in C that can run Linux.
 

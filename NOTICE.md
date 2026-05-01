@@ -1,12 +1,12 @@
 # NOTICE
 
-This project (`riscv-c`) is based on and derived from the work of
+This project (`riscv-emulator-linux`) is based on and derived from the work of
 Charles Lohr.
 
 Original project:
 
 * **mini-rv32ima**
-* Repository: https://github.com/cnlohr/riscv_emufun
+* Repository: https://github.com/cnlohr/mini-rv32ima
 
 ---
 

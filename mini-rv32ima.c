@@ -130,8 +130,6 @@ struct EmulatorState
 // a parameter. Do not use this pointer anywhere else.
 static struct EmulatorState * g_emu = 0;
 
-static const char * kernel_command_line = 0;
-
 //////////////////////////////////////////////////////////////////////////////
 // Platform forward declarations
 //////////////////////////////////////////////////////////////////////////////
@@ -718,26 +716,161 @@ static int64_t SimpleReadNumberInt( const char * number, int64_t defaultNumber )
 }
 
 //////////////////////////////////////////////////////////////////////////////
+// Emulator load
+//
+// Loads the kernel image and DTB into RAM, then initialises the CPU state.
+// Returns 0 on success, a negative error code on failure.
+// Safe to call again on the same EmulatorState to perform a soft reset.
+//////////////////////////////////////////////////////////////////////////////
+
+struct LoadConfig
+{
+	const char * image_file;
+	const char * dtb_file;        // NULL = use built-in default; "disable" = no DTB
+	const char * kernel_cmdline;  // NULL = no override
+};
+
+static int emulator_load( struct EmulatorState * emu, const struct LoadConfig * cfg )
+{
+	// Load kernel image
+	FILE * f = fopen( cfg->image_file, "rb" );
+	if( !f || ferror(f) )
+	{
+		fprintf( stderr, "Error: \"%s\" not found\n", cfg->image_file );
+		return -5;
+	}
+	fseek( f, 0, SEEK_END );
+	long flen = ftell( f );
+	fseek( f, 0, SEEK_SET );
+	if( (uint32_t)flen > emu->ram_size )
+	{
+		fprintf( stderr, "Error: image (%ld bytes) does not fit in %u bytes of RAM\n", flen, emu->ram_size );
+		fclose( f );
+		return -6;
+	}
+	memset( emu->ram, 0, emu->ram_size );
+	if( fread( emu->ram, flen, 1, f ) != 1 )
+	{
+		fprintf( stderr, "Error: could not load image.\n" );
+		fclose( f );
+		return -7;
+	}
+	fclose( f );
+
+	// Load or embed DTB
+	int dtb_ptr = 0;
+	if( cfg->dtb_file )
+	{
+		if( strcmp( cfg->dtb_file, "disable" ) != 0 )
+		{
+			f = fopen( cfg->dtb_file, "rb" );
+			if( !f || ferror(f) )
+			{
+				fprintf( stderr, "Error: \"%s\" not found\n", cfg->dtb_file );
+				return -5;
+			}
+			fseek( f, 0, SEEK_END );
+			long dtblen = ftell( f );
+			fseek( f, 0, SEEK_SET );
+			dtb_ptr = emu->ram_size - dtblen - sizeof( struct MiniRV32IMAState );
+			if( fread( emu->ram + dtb_ptr, dtblen, 1, f ) != 1 )
+			{
+				fprintf( stderr, "Error: could not load dtb \"%s\"\n", cfg->dtb_file );
+				fclose( f );
+				return -9;
+			}
+			fclose( f );
+		}
+	}
+	else
+	{
+		dtb_ptr = emu->ram_size - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
+		memcpy( emu->ram + dtb_ptr, default64mbdtb, sizeof(default64mbdtb) );
+		if( cfg->kernel_cmdline )
+			strncpy( (char*)(emu->ram + dtb_ptr + 0xc0), cfg->kernel_cmdline, 54 );
+
+		// Patch default DTB with actual usable RAM size
+		uint32_t * dtb = (uint32_t *)(emu->ram + dtb_ptr);
+		if( dtb[0x13c/4] == 0x00c0ff03 )
+		{
+			uint32_t v = (uint32_t)dtb_ptr;
+			dtb[0x13c/4] = (v>>24) | (((v>>16)&0xff)<<8) | (((v>>8)&0xff)<<16) | ((v&0xff)<<24);
+		}
+	}
+
+	// Initialise CPU
+	memset( &emu->cpu, 0, sizeof(emu->cpu) );
+	emu->cpu.pc       = RAM_IMAGE_OFFSET;
+	emu->cpu.regs[10] = 0x00;                                         // hart ID
+	emu->cpu.regs[11] = dtb_ptr ? (dtb_ptr + RAM_IMAGE_OFFSET) : 0;  // dtb pointer
+	cpu_set_privilege( &emu->cpu, 3 );                                // machine mode
+
+	return 0;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Emulator run
+//
+// Runs the execution loop until a terminal condition is reached.
+// Returns the RVStepResult that caused the exit.
+// RV_STEP_RESTART means the guest requested a soft reset — call
+// emulator_load() again and then emulator_run() to honour it.
+//////////////////////////////////////////////////////////////////////////////
+
+struct RunConfig
+{
+	long long instct;         // max instructions (-1 = unlimited)
+	int       time_divisor;   // time scaling factor
+	int       fixed_update;   // lock time to cycle count instead of wall clock
+	int       do_sleep;       // sleep on WFI instead of spinning
+	int       single_step;    // print full CPU state before each instruction
+};
+
+static RVStepResult emulator_run( struct EmulatorState * emu, const struct RunConfig * cfg )
+{
+	int      instrs_per_flip = cfg->single_step ? 1 : 1024;
+	uint64_t lastTime        = cfg->fixed_update ? 0 : (GetTimeMicroseconds() / cfg->time_divisor);
+
+	for( uint64_t rt = 0; rt < (uint64_t)(cfg->instct + 1) || cfg->instct < 0; rt += instrs_per_flip )
+	{
+		uint64_t cycle     = cpu_get_cycle64( &emu->cpu );
+		uint32_t elapsedUs = cfg->fixed_update
+		                   ? (uint32_t)(cycle / cfg->time_divisor - lastTime)
+		                   : (uint32_t)(GetTimeMicroseconds() / cfg->time_divisor - lastTime);
+		lastTime += elapsedUs;
+
+		if( cfg->single_step ) DumpState( emu );
+
+		RVStepResult ret = MiniRV32IMAStep( emu, elapsedUs, instrs_per_flip );
+		switch( ret )
+		{
+			case RV_STEP_OK:       break;
+			case RV_STEP_WFI:      if( cfg->do_sleep ) MiniSleep(); cpu_set_cycle64( &emu->cpu, cycle + instrs_per_flip ); break;
+			case RV_STEP_FAULT:    return ret;
+			case RV_STEP_RESTART:  return ret;
+			case RV_STEP_POWEROFF: return ret;
+			default:               printf( "Unknown failure\n" ); return ret;
+		}
+	}
+
+	return RV_STEP_OK;
+}
+
+//////////////////////////////////////////////////////////////////////////////
 // Main
 //////////////////////////////////////////////////////////////////////////////
 
 int main( int argc, char ** argv )
 {
 	int          i;
-	long long    instct           = -1;
 	int          show_help        = 0;
-	int          time_divisor     = 1;
-	int          fixed_update     = 0;
-	int          do_sleep         = 1;
-	int          single_step      = 0;
-	int          dtb_ptr          = 0;
 	uint32_t     ram_size         = 64 * 1024 * 1024;
-	const char * image_file_name  = 0;
-	const char * dtb_file_name    = 0;
+
+	struct LoadConfig load_cfg = { 0 };
+	struct RunConfig  run_cfg  = { .instct = -1, .time_divisor = 1, .do_sleep = 1 };
 
 	struct EmulatorState emu;
 	memset( &emu, 0, sizeof(emu) );
-	emu.fail_on_all_faults = 0;
 
 	for( i = 1; i < argc; i++ )
 	{
@@ -749,16 +882,16 @@ int main( int argc, char ** argv )
 			{
 				switch( param[1] )
 				{
-					case 'm': if( ++i < argc ) ram_size           = SimpleReadNumberInt( argv[i], ram_size ); break;
-					case 'c': if( ++i < argc ) instct             = SimpleReadNumberInt( argv[i], -1 );       break;
-					case 'k': if( ++i < argc ) kernel_command_line = argv[i];                                 break;
-					case 'f': image_file_name  = (++i < argc) ? argv[i] : 0;                                 break;
-					case 'b': dtb_file_name    = (++i < argc) ? argv[i] : 0;                                 break;
-					case 'l': param_continue = 1; fixed_update           = 1; break;
-					case 'p': param_continue = 1; do_sleep                = 0; break;
-					case 's': param_continue = 1; single_step             = 1; break;
-					case 'd': param_continue = 1; emu.fail_on_all_faults  = 1; break;
-					case 't': if( ++i < argc ) time_divisor = SimpleReadNumberInt( argv[i], 1 ); break;
+					case 'm': if( ++i < argc ) ram_size              = SimpleReadNumberInt( argv[i], ram_size );         break;
+					case 'c': if( ++i < argc ) run_cfg.instct        = SimpleReadNumberInt( argv[i], -1 );               break;
+					case 'k': if( ++i < argc ) load_cfg.kernel_cmdline = argv[i];                                        break;
+					case 'f': load_cfg.image_file = (++i < argc) ? argv[i] : 0;                                         break;
+					case 'b': load_cfg.dtb_file   = (++i < argc) ? argv[i] : 0;                                         break;
+					case 'l': param_continue = 1; run_cfg.fixed_update      = 1; break;
+					case 'p': param_continue = 1; run_cfg.do_sleep           = 0; break;
+					case 's': param_continue = 1; run_cfg.single_step        = 1; break;
+					case 'd': param_continue = 1; emu.fail_on_all_faults     = 1; break;
+					case 't': if( ++i < argc ) run_cfg.time_divisor = SimpleReadNumberInt( argv[i], 1 ); break;
 					default:
 						if( param_continue ) param_continue = 0;
 						else show_help = 1;
@@ -770,7 +903,7 @@ int main( int argc, char ** argv )
 		} while( param_continue );
 	}
 
-	if( show_help || image_file_name == 0 || time_divisor <= 0 )
+	if( show_help || load_cfg.image_file == 0 || run_cfg.time_divisor <= 0 )
 	{
 		fprintf( stderr,
 			"./mini-rv32ima [parameters]\n"
@@ -796,113 +929,24 @@ int main( int argc, char ** argv )
 	}
 
 	g_emu = &emu;
-
-restart:
-	{
-		FILE * f = fopen( image_file_name, "rb" );
-		if( !f || ferror(f) )
-		{
-			fprintf( stderr, "Error: \"%s\" not found\n", image_file_name );
-			return -5;
-		}
-		fseek( f, 0, SEEK_END );
-		long flen = ftell( f );
-		fseek( f, 0, SEEK_SET );
-		if( (uint32_t)flen > ram_size )
-		{
-			fprintf( stderr, "Error: image (%ld bytes) does not fit in %u bytes of RAM\n", flen, ram_size );
-			return -6;
-		}
-		memset( emu.ram, 0, ram_size );
-		if( fread( emu.ram, flen, 1, f ) != 1 )
-		{
-			fprintf( stderr, "Error: could not load image.\n" );
-			return -7;
-		}
-		fclose( f );
-
-		if( dtb_file_name )
-		{
-			if( strcmp( dtb_file_name, "disable" ) != 0 )
-			{
-				f = fopen( dtb_file_name, "rb" );
-				if( !f || ferror(f) )
-				{
-					fprintf( stderr, "Error: \"%s\" not found\n", dtb_file_name );
-					return -5;
-				}
-				fseek( f, 0, SEEK_END );
-				long dtblen = ftell( f );
-				fseek( f, 0, SEEK_SET );
-				dtb_ptr = ram_size - dtblen - sizeof( struct MiniRV32IMAState );
-				if( fread( emu.ram + dtb_ptr, dtblen, 1, f ) != 1 )
-				{
-					fprintf( stderr, "Error: could not load dtb \"%s\"\n", dtb_file_name );
-					return -9;
-				}
-				fclose( f );
-			}
-		}
-		else
-		{
-			dtb_ptr = ram_size - sizeof(default64mbdtb) - sizeof( struct MiniRV32IMAState );
-			memcpy( emu.ram + dtb_ptr, default64mbdtb, sizeof(default64mbdtb) );
-			if( kernel_command_line )
-				strncpy( (char*)(emu.ram + dtb_ptr + 0xc0), kernel_command_line, 54 );
-		}
-	}
-
 	CaptureKeyboardInput();
 
-	// CPU lives at the very end of RAM
-	memset( &emu.cpu, 0, sizeof(emu.cpu) );
-	emu.cpu.pc          = RAM_IMAGE_OFFSET;
-	emu.cpu.regs[10]    = 0x00;                                          // hart ID
-	emu.cpu.regs[11]    = dtb_ptr ? (dtb_ptr + RAM_IMAGE_OFFSET) : 0;   // dtb pointer
-	cpu_set_privilege( &emu.cpu, 3 );                                            // machine mode
-
-	if( dtb_file_name == 0 )
+	RVStepResult result;
+	do
 	{
-		// Patch default DTB with actual usable RAM size
-		uint32_t * dtb = (uint32_t *)(emu.ram + dtb_ptr);
-		if( dtb[0x13c/4] == 0x00c0ff03 )
-		{
-			uint32_t v = dtb_ptr;
-			dtb[0x13c/4] = (v>>24) | (((v>>16)&0xff)<<8) | (((v>>8)&0xff)<<16) | ((v&0xff)<<24);
-		}
+		int err = emulator_load( &emu, &load_cfg );
+		if( err != 0 ) return err;
+
+		result = emulator_run( &emu, &run_cfg );
 	}
+	while( result == RV_STEP_RESTART );
 
-	uint64_t lastTime        = fixed_update ? 0 : (GetTimeMicroseconds() / time_divisor);
-	int      instrs_per_flip = single_step ? 1 : 1024;
-
-	for( uint64_t rt = 0; rt < (uint64_t)(instct + 1) || instct < 0; rt += instrs_per_flip )
-	{
-		uint64_t   cycle     = cpu_get_cycle64( &emu.cpu );
-		uint32_t   elapsedUs = fixed_update
-		                     ? (uint32_t)(cycle / time_divisor - lastTime)
-		                     : (uint32_t)(GetTimeMicroseconds() / time_divisor - lastTime);
-		lastTime += elapsedUs;
-
-		if( single_step ) DumpState( &emu );
-
-		RVStepResult ret = MiniRV32IMAStep( &emu, elapsedUs, instrs_per_flip );
-		switch( ret )
-		{
-			case RV_STEP_OK:       break;
-			case RV_STEP_WFI:      if( do_sleep ) MiniSleep(); cpu_set_cycle64( &emu.cpu, cycle + instrs_per_flip ); break;
-			case RV_STEP_FAULT:    instct = 0; break;
-			case RV_STEP_RESTART:  goto restart;
-			case RV_STEP_POWEROFF: printf( "POWEROFF@0x%08x%08x\n", emu.cpu.cycleh, emu.cpu.cyclel ); return 0;
-			default:               printf( "Unknown failure\n" ); break;
-		}
-	}
+	if( result == RV_STEP_POWEROFF )
+		printf( "POWEROFF@0x%08x%08x\n", emu.cpu.cycleh, emu.cpu.cyclel );
 
 	DumpState( &emu );
 	return 0;
 }
-
-//////////////////////////////////////////////////////////////////////////////
-// Platform: Windows
 //////////////////////////////////////////////////////////////////////////////
 
 #if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)

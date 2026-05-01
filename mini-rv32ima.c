@@ -29,8 +29,36 @@ typedef enum
 } RVStepResult;
 
 //////////////////////////////////////////////////////////////////////////////
-// CPU state
+// Trap codes
+//
+// Exceptions follow the RISC-V spec mcause table (volume II, table 3.6).
+// The interrupt flag lives in bit 31, matching the hardware register layout.
+// rv_trap_to_mcause() converts directly to what gets written into mcause,
+// so the commit path has no arithmetic — just call and assign.
 //////////////////////////////////////////////////////////////////////////////
+
+typedef enum
+{
+	RV_TRAP_NONE               = 0,
+
+	// Exceptions (bit 31 clear) — values equal mcause directly
+	RV_EXC_INSN_MISALIGNED     = 0,  // mcause 0
+	RV_EXC_INSN_ACCESS_FAULT   = 1,  // mcause 1
+	RV_EXC_ILLEGAL_INSN        = 2,  // mcause 2
+	RV_EXC_BREAKPOINT          = 3,  // mcause 3
+	RV_EXC_LOAD_ACCESS_FAULT   = 5,  // mcause 5
+	RV_EXC_STORE_ACCESS_FAULT  = 7,  // mcause 7
+	RV_EXC_ECALL_U             = 8,  // mcause 8
+	RV_EXC_ECALL_M             = 11, // mcause 11
+
+	// Interrupts (bit 31 set) — value written directly to mcause
+	RV_INT_TIMER               = 0x80000007, // mcause 0x80000007 (MTIP)
+} RVTrap;
+
+static inline int      rv_trap_is_interrupt( RVTrap t ) { return (uint32_t)t & 0x80000000; }
+static inline uint32_t rv_trap_to_mcause   ( RVTrap t ) { return (uint32_t)t; }
+
+
 
 struct MiniRV32IMAState
 {
@@ -269,7 +297,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 	if( state->extraflags & 4 )
 		return RV_STEP_WFI;
 
-	uint32_t trap  = 0;
+	RVTrap   trap  = RV_TRAP_NONE;
 	uint32_t rval  = 0;
 	uint32_t pc    = state->pc;
 	uint32_t cycle = state->cyclel;
@@ -277,7 +305,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 	// Pending timer interrupt?
 	if( (state->mip & (1<<7)) && (state->mie & (1<<7)) && (state->mstatus & 0x8) )
 	{
-		trap = 0x80000007;
+		trap = RV_INT_TIMER;
 		pc  -= 4;
 	}
 	else
@@ -290,12 +318,12 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 		if( ofs_pc >= ram_size )
 		{
-			trap = 2; // instruction access fault
+			trap = RV_EXC_INSN_ACCESS_FAULT;
 			break;
 		}
 		else if( ofs_pc & 3 )
 		{
-			trap = 1; // instruction address misaligned
+			trap = RV_EXC_INSN_MISALIGNED;
 			break;
 		}
 
@@ -343,7 +371,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 					case 5: if(  rs1 >=  rs2 )                    pc = target; break; // BGE
 					case 6: if( (uint32_t)rs1  < (uint32_t)rs2 )  pc = target; break; // BLTU
 					case 7: if( (uint32_t)rs1 >= (uint32_t)rs2 )  pc = target; break; // BGEU
-					default: trap = 2;
+					default: trap = RV_EXC_ILLEGAL_INSN;
 				}
 				break;
 			}
@@ -358,7 +386,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 				{
 					if( is_mmio(addr) )
 						rval = HandleControlLoad( emu, addr );
-					else { trap = 5; rval = addr; } // load access fault
+					else { trap = RV_EXC_LOAD_ACCESS_FAULT; rval = addr; }
 				}
 				else
 				{
@@ -369,7 +397,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 						case 2: rval = mem_load4 ( image, ofs ); break; // LW
 						case 4: rval = mem_load1 ( image, ofs ); break; // LBU
 						case 5: rval = mem_load2 ( image, ofs ); break; // LHU
-						default: trap = 2;
+						default: trap = RV_EXC_ILLEGAL_INSN;
 					}
 				}
 				break;
@@ -391,7 +419,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 						RVStepResult sr = HandleControlStore( emu, addr, rs2 );
 						if( sr != RV_STEP_OK ) return sr;
 					}
-					else { trap = 7; rval = addr; } // store access fault
+					else { trap = RV_EXC_STORE_ACCESS_FAULT; rval = addr; }
 				}
 				else
 				{
@@ -400,7 +428,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 						case 0: mem_store1( image, ofs, rs2 ); break; // SB
 						case 1: mem_store2( image, ofs, rs2 ); break; // SH
 						case 2: mem_store4( image, ofs, rs2 ); break; // SW
-						default: trap = 2;
+						default: trap = RV_EXC_ILLEGAL_INSN;
 					}
 				}
 				break;
@@ -514,8 +542,8 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 					{
 						switch( csrno )
 						{
-							case 0x000: trap = (state->extraflags & 3) ? 12 : 9; break; // ECALL
-							case 0x001: trap = 4; break; // EBREAK
+							case 0x000: trap = (state->extraflags & 3) ? RV_EXC_ECALL_M : RV_EXC_ECALL_U; break; // ECALL
+							case 0x001: trap = RV_EXC_BREAKPOINT; break; // EBREAK
 							case 0x105: // WFI
 								state->mstatus    |= 8;
 								state->extraflags |= 4;
@@ -523,12 +551,12 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 								state->cyclel = cycle;
 								state->pc     = pc + 4;
 								return RV_STEP_WFI;
-							default: trap = 2; // illegal
+							default: trap = RV_EXC_ILLEGAL_INSN;
 						}
 					}
 				}
 				else
-					trap = 2; // illegal
+					trap = RV_EXC_ILLEGAL_INSN;
 				break;
 			}
 
@@ -541,7 +569,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 
 				if( ofs >= ram_size - 3 )
 				{
-					trap = 7; // store/AMO access fault
+					trap = RV_EXC_STORE_ACCESS_FAULT;
 					rval = rs1;
 				}
 				else
@@ -561,7 +589,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 						case 20: rs2 = ((int32_t)rs2 > (int32_t)rval) ? rs2 : rval; break;                        // AMOMAX.W
 						case 24: rs2 = (rs2 < rval) ? rs2 : rval; break;                                          // AMOMINU.W
 						case 28: rs2 = (rs2 > rval) ? rs2 : rval; break;                                          // AMOMAXU.W
-						default: trap = 2; dowrite = 0; break;
+						default: trap = RV_EXC_ILLEGAL_INSN; dowrite = 0; break;
 					}
 					if( dowrite ) mem_store4( image, ofs, rs2 );
 				}
@@ -569,10 +597,10 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 			}
 
 			default:
-				trap = 2; // illegal opcode
+				trap = RV_EXC_ILLEGAL_INSN;
 		}
 
-		if( trap )
+		if( trap != RV_TRAP_NONE )
 		{
 			state->pc = pc;
 			if( emu->fail_on_all_faults ) { printf( "FAULT\n" ); return RV_STEP_FAULT; }
@@ -585,19 +613,20 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 		pc += 4;
 	}
 
-	// Handle traps and interrupts
-	if( trap )
+	// Commit trap or interrupt to CPU state
+	if( trap != RV_TRAP_NONE )
 	{
-		if( trap & 0x80000000 ) // interrupt
+		if( rv_trap_is_interrupt( trap ) )
 		{
-			state->mcause = trap;
+			state->mcause = rv_trap_to_mcause( trap );
 			state->mtval  = 0;
 			pc += 4;
 		}
-		else // exception
+		else
 		{
-			state->mcause = trap - 1;
-			state->mtval  = (trap > 5 && trap <= 8) ? rval : pc;
+			state->mcause = rv_trap_to_mcause( trap );
+			state->mtval  = (trap == RV_EXC_LOAD_ACCESS_FAULT ||
+			                 trap == RV_EXC_STORE_ACCESS_FAULT) ? rval : pc;
 		}
 		state->mepc    = pc;
 		state->mstatus = ((state->mstatus & 0x08) << 4) | ((state->extraflags & 3) << 11);

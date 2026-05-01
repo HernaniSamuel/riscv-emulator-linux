@@ -90,6 +90,31 @@ struct MiniRV32IMAState
 };
 
 //////////////////////////////////////////////////////////////////////////////
+// extraflags accessors
+//
+// extraflags packs three independent concepts into one uint32_t:
+//   bits 0..1  — privilege level  (0 = User, 3 = Machine)
+//   bit  2     — WFI sleep flag
+//   bits 3..31 — LR/SC reservation address (RAM offset >> 0, shifted up by 3)
+//
+// In a Rust port these become separate fields; here we isolate all
+// bit manipulation behind named functions so the rest of the code
+// never needs to know the layout.
+//////////////////////////////////////////////////////////////////////////////
+
+static inline uint32_t cpu_get_privilege  ( const struct MiniRV32IMAState * s ) { return  s->extraflags & 0x3; }
+static inline void     cpu_set_privilege  ( struct MiniRV32IMAState * s, uint32_t priv ) { s->extraflags = (s->extraflags & ~0x3) | (priv & 0x3); }
+static inline int      cpu_get_wfi        ( const struct MiniRV32IMAState * s ) { return  (s->extraflags >> 2) & 1; }
+static inline void     cpu_set_wfi        ( struct MiniRV32IMAState * s, int v  ) { if(v) s->extraflags |= 4; else s->extraflags &= ~4; }
+static inline uint32_t cpu_get_reservation( const struct MiniRV32IMAState * s ) { return  s->extraflags >> 3; }
+static inline void     cpu_set_reservation( struct MiniRV32IMAState * s, uint32_t ofs ) { s->extraflags = (s->extraflags & 0x7) | (ofs << 3); }
+
+// cycle is a 64-bit counter split across two uint32_t fields.
+// Composing it here avoids the UB cast (uint64_t*)&cyclel used previously.
+static inline uint64_t cpu_get_cycle64( const struct MiniRV32IMAState * s ) { return ((uint64_t)s->cycleh << 32) | s->cyclel; }
+static inline void     cpu_set_cycle64( struct MiniRV32IMAState * s, uint64_t v ) { s->cyclel = (uint32_t)v; s->cycleh = (uint32_t)(v >> 32); }
+
+//////////////////////////////////////////////////////////////////////////////
 // Emulator state
 //////////////////////////////////////////////////////////////////////////////
 
@@ -287,14 +312,14 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 	    ( state->timerh == state->timermatchh && state->timerl > state->timermatchl ) )
 	    && ( state->timermatchh || state->timermatchl ) )
 	{
-		state->extraflags &= ~4;
+		cpu_set_wfi( state, 0 );
 		state->mip |= 1 << 7;
 	}
 	else
 		state->mip &= ~(1 << 7);
 
 	// WFI: processor sleeping
-	if( state->extraflags & 4 )
+	if( cpu_get_wfi( state ) )
 		return RV_STEP_WFI;
 
 	RVTrap   trap  = RV_TRAP_NONE;
@@ -465,7 +490,7 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 						case 2: rval = (int32_t)rs1 < (int32_t)rs2; break; // SLT
 						case 3: rval = rs1 < rs2; break; // SLTU
 						case 4: rval = rs1 ^ rs2; break; // XOR
-						case 5: rval = (ir & 0x40000000) ? ((int32_t)rs1 >> (rs2 & 0x1f)) : (rs1 >> (rs2 & 0x1f)); break; // SRL/SRA
+						case 5: rval = (ir & 0x40000000) ? (uint32_t)((int32_t)rs1 >> (rs2 & 0x1f)) : (rs1 >> (rs2 & 0x1f)); break; // SRL/SRA
 						case 6: rval = rs1 | rs2; break; // OR
 						case 7: rval = rs1 & rs2; break; // AND
 					}
@@ -532,21 +557,21 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 					rdid = 0;
 					if( (csrno & 0xff) == 0x02 ) // MRET
 					{
-						uint32_t ms = state->mstatus;
-						uint32_t ef = state->extraflags;
-						state->mstatus    = ((ms & 0x80) >> 4) | ((ef & 3) << 11) | 0x80;
-						state->extraflags = (ef & ~3) | ((ms >> 11) & 3);
+						uint32_t ms   = state->mstatus;
+						uint32_t prev = (ms >> 11) & 3;  // MPP = previous privilege
+						state->mstatus = ((ms & 0x80) >> 4) | (cpu_get_privilege(state) << 11) | 0x80;
+						cpu_set_privilege( state, prev );
 						pc = state->mepc - 4;
 					}
 					else
 					{
 						switch( csrno )
 						{
-							case 0x000: trap = (state->extraflags & 3) ? RV_EXC_ECALL_M : RV_EXC_ECALL_U; break; // ECALL
+							case 0x000: trap = cpu_get_privilege(state) ? RV_EXC_ECALL_M : RV_EXC_ECALL_U; break; // ECALL
 							case 0x001: trap = RV_EXC_BREAKPOINT; break; // EBREAK
 							case 0x105: // WFI
-								state->mstatus    |= 8;
-								state->extraflags |= 4;
+								state->mstatus |= 8;
+								cpu_set_wfi( state, 1 );
 								if( state->cyclel > cycle ) state->cycleh++;
 								state->cyclel = cycle;
 								state->pc     = pc + 4;
@@ -578,8 +603,8 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 					int dowrite = 1;
 					switch( irmid )
 					{
-						case 2:  dowrite = 0; state->extraflags = (state->extraflags & 0x07) | (ofs << 3); break; // LR.W
-						case 3:  rval = (state->extraflags >> 3) != (ofs & 0x1fffffff); dowrite = !rval;    break; // SC.W
+						case 2:  dowrite = 0; cpu_set_reservation( state, ofs ); break;                                     // LR.W
+						case 3:  rval = cpu_get_reservation(state) != (ofs & 0x1fffffff); dowrite = !rval; break;             // SC.W
 						case 1:  break;                                                                            // AMOSWAP.W
 						case 0:  rs2 += rval; break;                                                               // AMOADD.W
 						case 4:  rs2 ^= rval; break;                                                               // AMOXOR.W
@@ -629,9 +654,9 @@ static RVStepResult MiniRV32IMAStep( struct EmulatorState * emu, uint32_t elapse
 			                 trap == RV_EXC_STORE_ACCESS_FAULT) ? rval : pc;
 		}
 		state->mepc    = pc;
-		state->mstatus = ((state->mstatus & 0x08) << 4) | ((state->extraflags & 3) << 11);
+		state->mstatus = ((state->mstatus & 0x08) << 4) | (cpu_get_privilege(state) << 11);
 		pc = state->mtvec - 4;
-		state->extraflags |= 3; // enter machine mode
+		cpu_set_privilege( state, 3 ); // enter machine mode
 		pc += 4;
 	}
 
@@ -834,7 +859,7 @@ restart:
 	emu.cpu.pc          = RAM_IMAGE_OFFSET;
 	emu.cpu.regs[10]    = 0x00;                                          // hart ID
 	emu.cpu.regs[11]    = dtb_ptr ? (dtb_ptr + RAM_IMAGE_OFFSET) : 0;   // dtb pointer
-	emu.cpu.extraflags |= 3;                                             // machine mode
+	cpu_set_privilege( &emu.cpu, 3 );                                            // machine mode
 
 	if( dtb_file_name == 0 )
 	{
@@ -852,10 +877,10 @@ restart:
 
 	for( uint64_t rt = 0; rt < (uint64_t)(instct + 1) || instct < 0; rt += instrs_per_flip )
 	{
-		uint64_t * this_ccount = (uint64_t *)&emu.cpu.cyclel;
-		uint32_t   elapsedUs   = fixed_update
-		                       ? (uint32_t)(*this_ccount / time_divisor - lastTime)
-		                       : (uint32_t)(GetTimeMicroseconds() / time_divisor - lastTime);
+		uint64_t   cycle     = cpu_get_cycle64( &emu.cpu );
+		uint32_t   elapsedUs = fixed_update
+		                     ? (uint32_t)(cycle / time_divisor - lastTime)
+		                     : (uint32_t)(GetTimeMicroseconds() / time_divisor - lastTime);
 		lastTime += elapsedUs;
 
 		if( single_step ) DumpState( &emu );
@@ -864,7 +889,7 @@ restart:
 		switch( ret )
 		{
 			case RV_STEP_OK:       break;
-			case RV_STEP_WFI:      if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
+			case RV_STEP_WFI:      if( do_sleep ) MiniSleep(); cpu_set_cycle64( &emu.cpu, cycle + instrs_per_flip ); break;
 			case RV_STEP_FAULT:    instct = 0; break;
 			case RV_STEP_RESTART:  goto restart;
 			case RV_STEP_POWEROFF: printf( "POWEROFF@0x%08x%08x\n", emu.cpu.cycleh, emu.cpu.cyclel ); return 0;

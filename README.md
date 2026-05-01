@@ -18,6 +18,14 @@ If it runs on your machine, congratulations.
 
 ---
 
+## 📦 Requirements
+
+- Windows
+- PowerShell
+- GCC (MinGW or similar) installed and available in PATH
+
+---
+
 ## 🚀 How to run
 
 Clone the repository and run:
@@ -27,6 +35,39 @@ Clone the repository and run:
 ```
 
 If everything goes well, you should land in a Linux shell (BusyBox).
+
+When prompted:
+
+```
+buildroot login:
+```
+
+Just type:
+
+```
+root
+```
+
+(No password is required)
+
+---
+
+## 🔐 Notes
+
+- The system runs entirely inside the emulator
+- There is no real disk, no network, and no access to your host machine
+- You have full root access inside the emulated environment
+
+---
+
+## ⚠️ Controls / Behavior
+
+- Pressing `Ctrl+C` will exit the emulator immediately  
+  (it does not send a signal to the emulated Linux system)
+
+- In other words: it kills everything, not just the shell inside Linux
+
+- This is a limitation of the current implementation
 
 ---
 
